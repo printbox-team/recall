@@ -219,16 +219,34 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
             };
 
-            let header_spans = vec![
+            let mut header_spans = vec![
                 Span::styled("📁 ", header_style),
                 Span::styled(result.session.project_name(), header_style),
+            ];
+            if let Some(title) = result.session.title.as_deref() {
+                header_spans.push(Span::styled(
+                    "  ▸ ",
+                    Style::default().fg(t.snippet_fg),
+                ));
+                let title_style = if is_selected {
+                    Style::default()
+                        .fg(t.selection_header_fg)
+                        .add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default()
+                        .fg(t.snippet_fg)
+                        .add_modifier(Modifier::ITALIC)
+                };
+                header_spans.push(Span::styled(title.to_string(), title_style));
+            }
+            header_spans.extend([
                 Span::styled("  ", header_style),
                 Span::styled(
                     format!("{} {}", result.session.source.icon(), result.session.source.display_name()),
                     Style::default().fg(source_color),
                 ),
                 Span::styled(format!("  {}", time_ago), header_style),
-            ];
+            ]);
 
             // Truncate snippet to fit available width (Tantivy already centered it)
             let snippet: String = result.snippet.chars().take(available_width).collect();

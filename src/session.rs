@@ -84,6 +84,12 @@ pub struct Session {
     pub cwd: String,
     pub git_branch: Option<String>,
     pub timestamp: DateTime<Utc>,
+    /// Human-readable session title.
+    /// - Claude: from `custom-title` (preferred) or `ai-title` JSONL entries
+    /// - Factory: from the `title` field in JSONL lines
+    /// - OpenCode: from the `title` field in the session JSON
+    /// - Codex: not stored by Codex, always None
+    pub title: Option<String>,
     pub messages: Vec<Message>,
 }
 
@@ -172,6 +178,8 @@ pub struct SearchResultOutput {
     pub source: SessionSource,
     pub cwd: String,
     pub timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub relevant_messages: Vec<Message>,
     pub resume_command: String,
 }
@@ -189,6 +197,8 @@ pub struct SessionSummary {
     pub source: SessionSource,
     pub cwd: String,
     pub timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub resume_command: String,
 }
 
@@ -199,6 +209,8 @@ pub struct ReadOutput {
     pub source: SessionSource,
     pub cwd: String,
     pub timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub messages: Vec<Message>,
     pub resume_command: String,
 }
@@ -217,6 +229,7 @@ impl Session {
             source: self.source,
             cwd: self.cwd.clone(),
             timestamp: self.timestamp,
+            title: self.title.clone(),
             messages: self.messages.clone(),
             resume_command: resume_str,
         }
@@ -235,6 +248,7 @@ impl Session {
             source: self.source,
             cwd: self.cwd.clone(),
             timestamp: self.timestamp,
+            title: self.title.clone(),
             resume_command: resume_str,
         }
     }

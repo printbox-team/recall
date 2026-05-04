@@ -159,6 +159,7 @@ impl SessionParser for CodexParser {
             cwd: cwd.unwrap_or_else(|| ".".to_string()),
             git_branch,
             timestamp: latest_timestamp.unwrap_or_else(Utc::now),
+            title: None,
             messages: join_consecutive_messages(messages),
         })
     }

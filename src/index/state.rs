@@ -18,7 +18,10 @@ pub struct FileState {
 }
 
 impl IndexState {
-    const CURRENT_VERSION: u32 = 1;
+    /// Bump whenever the Tantivy schema or parser output changes in a way that
+    /// invalidates previously-indexed documents. `migrate_if_needed` wipes the
+    /// index dir + state file when the on-disk version doesn't match.
+    const CURRENT_VERSION: u32 = 2;
 
     /// Load state from disk or create new
     pub fn load(state_path: &Path) -> Result<Self> {
@@ -34,6 +37,37 @@ impl IndexState {
                 version: Self::CURRENT_VERSION,
             })
         }
+    }
+
+    /// Wipe the index directory + state file if the persisted schema version
+    /// doesn't match `CURRENT_VERSION`. Call before opening the Tantivy index
+    /// so the new schema is used. No-op when versions match.
+    pub fn migrate_if_needed(state_path: &Path, index_path: &Path) -> Result<()> {
+        let needs_reset = if state_path.exists() {
+            match std::fs::read_to_string(state_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            {
+                Some(state) => state.version != Self::CURRENT_VERSION,
+                None => true, // unreadable state file -> reset
+            }
+        } else {
+            // No state but a Tantivy index exists -> almost certainly an old
+            // build. Wipe it so the fresh schema is used.
+            index_path.join("meta.json").exists()
+        };
+
+        if needs_reset {
+            if index_path.exists() {
+                std::fs::remove_dir_all(index_path)
+                    .context("Failed to remove old index directory")?;
+            }
+            if state_path.exists() {
+                std::fs::remove_file(state_path)
+                    .context("Failed to remove old state file")?;
+            }
+        }
+        Ok(())
     }
 
     /// Save state to disk

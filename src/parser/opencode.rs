@@ -16,7 +16,6 @@ struct OpenCodeSession {
     #[allow(dead_code)]
     project_id: Option<String>,
     directory: Option<String>,
-    #[allow(dead_code)]
     title: Option<String>,
     time: Option<TimeInfo>,
 }
@@ -166,6 +165,7 @@ impl SessionParser for OpenCodeParser {
                     .map(|t| millis_to_datetime(t.created))
                     .unwrap_or_else(Utc::now)
             }),
+            title: session.title.filter(|s| !s.is_empty()),
             messages: join_consecutive_messages(messages),
         })
     }

@@ -13,7 +13,6 @@ struct FactoryLine {
     #[serde(rename = "type")]
     entry_type: String,
     id: Option<String>,
-    #[allow(dead_code)]
     title: Option<String>,
     cwd: Option<String>,
     timestamp: Option<String>,
@@ -44,6 +43,7 @@ impl SessionParser for FactoryParser {
         let mut cwd: Option<String> = None;
         let mut latest_timestamp: Option<DateTime<Utc>> = None;
         let mut messages: Vec<Message> = Vec::new();
+        let mut title: Option<String> = None;
 
         for line in reader.lines() {
             let line = line.context("Failed to read line")?;
@@ -55,6 +55,11 @@ impl SessionParser for FactoryParser {
                 Ok(e) => e,
                 Err(_) => continue, // Skip malformed lines
             };
+
+            // Capture title from any line that carries it (typically session_start)
+            if let Some(t) = entry.title.clone().filter(|s| !s.is_empty()) {
+                title = Some(t);
+            }
 
             match entry.entry_type.as_str() {
                 "session_start" => {
@@ -122,6 +127,7 @@ impl SessionParser for FactoryParser {
             cwd: cwd.unwrap_or_else(|| ".".to_string()),
             git_branch: None,
             timestamp: latest_timestamp.unwrap_or_else(Utc::now),
+            title,
             messages: join_consecutive_messages(messages),
         })
     }

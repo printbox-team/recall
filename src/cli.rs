@@ -109,6 +109,7 @@ pub fn run_search(
                     source: r.session.source,
                     cwd: r.session.cwd,
                     timestamp: r.session.timestamp,
+                    title: r.session.title,
                     relevant_messages,
                     resume_command,
                 }
@@ -187,6 +188,7 @@ fn search_in_session(
             source: session.source,
             cwd: session.cwd,
             timestamp: session.timestamp,
+            title: session.title,
             relevant_messages,
             resume_command,
         }],

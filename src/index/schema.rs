@@ -33,6 +33,7 @@ pub struct SessionIndex {
     git_branch: Field,
     timestamp: Field,
     content: Field,
+    title: Field,
     message_index: Field,
 }
 
@@ -44,6 +45,15 @@ impl SessionIndex {
 
     /// Open existing index or create a new one
     pub fn open_or_create(index_path: &Path) -> Result<Self> {
+        // If the persisted schema version differs from the current build,
+        // wipe the index dir + state.json so the new schema is used. The
+        // sibling state file is the source of truth for the version.
+        let state_path = index_path
+            .parent()
+            .map(|p| p.join("state.json"))
+            .unwrap_or_else(|| index_path.join("state.json"));
+        crate::index::IndexState::migrate_if_needed(&state_path, index_path)?;
+
         std::fs::create_dir_all(index_path)?;
 
         let schema = Self::build_schema();
@@ -71,6 +81,7 @@ impl SessionIndex {
             git_branch: schema.get_field("git_branch").unwrap(),
             timestamp: schema.get_field("timestamp").unwrap(),
             content: schema.get_field("content").unwrap(),
+            title: schema.get_field("title").unwrap(),
             message_index: schema.get_field("message_index").unwrap(),
             schema,
         })
@@ -95,6 +106,9 @@ impl SessionIndex {
         // Searchable content field
         builder.add_text_field("content", TEXT | STORED);
 
+        // Searchable session title (custom-title / ai-title for Claude, title for Factory/OpenCode)
+        builder.add_text_field("title", TEXT | STORED);
+
         builder.build()
     }
 
@@ -108,8 +122,11 @@ impl SessionIndex {
     /// Index a single session (all its messages)
     pub fn index_session(&self, writer: &mut IndexWriter, session: &Session) -> Result<()> {
         let timestamp_secs = session.timestamp.timestamp();
+        let title = session.title.clone().unwrap_or_default();
 
-        // Index each message separately for match-recency ranking
+        // Index each message separately for match-recency ranking.
+        // Title is duplicated on each message doc so a title hit returns any
+        // message in the session, and the per-session grouping later collapses them.
         for (idx, message) in session.messages.iter().enumerate() {
             let doc = doc!(
                 self.session_id => session.id.clone(),
@@ -120,6 +137,7 @@ impl SessionIndex {
                 self.timestamp => timestamp_secs,
                 self.message_index => idx as u64,
                 self.content => message.content.clone(),
+                self.title => title.clone(),
             );
             writer.add_document(doc)?;
         }
@@ -149,7 +167,11 @@ impl SessionIndex {
         }
 
         let searcher = self.reader.searcher();
-        let query_parser = QueryParser::for_index(&self.index, vec![self.content]);
+        let mut query_parser =
+            QueryParser::for_index(&self.index, vec![self.content, self.title]);
+        // Boost title hits so a query that matches a session name ranks above a
+        // session that only contains the same words inside a message.
+        query_parser.set_field_boost(self.title, 5.0);
 
         let base_query = query_parser
             .parse_query(query_str)
@@ -158,20 +180,30 @@ impl SessionIndex {
         // Boost exact phrase matches for multi-word queries
         // Use the same tokenizer that indexed the content to tokenize the query
         let query: Box<dyn Query> = if let Some(mut tokenizer) = self.index.tokenizers().get("default") {
-            let mut terms: Vec<(usize, tantivy::Term)> = Vec::new();
+            let mut content_terms: Vec<(usize, tantivy::Term)> = Vec::new();
+            let mut title_terms: Vec<(usize, tantivy::Term)> = Vec::new();
             let mut token_stream = tokenizer.token_stream(query_str);
             token_stream.process(&mut |token| {
-                let term = tantivy::Term::from_field_text(self.content, &token.text);
-                terms.push((token.position, term));
+                content_terms.push((
+                    token.position,
+                    tantivy::Term::from_field_text(self.content, &token.text),
+                ));
+                title_terms.push((
+                    token.position,
+                    tantivy::Term::from_field_text(self.title, &token.text),
+                ));
             });
 
-            if terms.len() > 1 {
-                let phrase_query = PhraseQuery::new_with_offset(terms);
-                let boosted_phrase = BoostQuery::new(Box::new(phrase_query), 10.0);
+            if content_terms.len() > 1 {
+                let content_phrase = PhraseQuery::new_with_offset(content_terms);
+                let title_phrase = PhraseQuery::new_with_offset(title_terms);
+                let boosted_content_phrase = BoostQuery::new(Box::new(content_phrase), 10.0);
+                let boosted_title_phrase = BoostQuery::new(Box::new(title_phrase), 50.0);
 
-                // Combine: phrase (boosted) OR terms
+                // Combine: title-phrase OR content-phrase OR terms
                 Box::new(BooleanQuery::new(vec![
-                    (Occur::Should, Box::new(boosted_phrase) as Box<dyn Query>),
+                    (Occur::Should, Box::new(boosted_title_phrase) as Box<dyn Query>),
+                    (Occur::Should, Box::new(boosted_content_phrase) as Box<dyn Query>),
                     (Occur::Should, base_query),
                 ]))
             } else {
@@ -237,6 +269,12 @@ impl SessionIndex {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
 
+            let title = doc
+                .get_first(self.title)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+
             // Use Tantivy's SnippetGenerator for accurate snippet with highlights
             let tantivy_snippet = snippet_generator.snippet_from_doc(&doc);
             let fragment = tantivy_snippet.fragment();
@@ -259,6 +297,7 @@ impl SessionIndex {
                     git_branch,
                     timestamp: chrono::DateTime::from_timestamp(timestamp_secs, 0)
                         .unwrap_or_default(),
+                    title,
                     messages: Vec::new(), // We don't load all messages for search results
                 },
                 score,
@@ -375,6 +414,12 @@ impl SessionIndex {
                 .unwrap_or("")
                 .to_string();
 
+            let title = doc
+                .get_first(self.title)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+
             // Use first part of content as snippet
             let snippet: String = content.chars().take(200).collect();
             let snippet = snippet.replace('\n', " ");
@@ -388,6 +433,7 @@ impl SessionIndex {
                     git_branch,
                     timestamp: chrono::DateTime::from_timestamp(timestamp_secs, 0)
                         .unwrap_or_default(),
+                    title,
                     messages: Vec::new(),
                 },
                 score: 0.0,
@@ -406,7 +452,7 @@ impl SessionIndex {
 
         // Sort by timestamp descending
         let mut results: Vec<_> = session_results.into_values().collect();
-        results.sort_by(|a, b| b.session.timestamp.cmp(&a.session.timestamp));
+        results.sort_by_key(|r| std::cmp::Reverse(r.session.timestamp));
         results.truncate(limit);
 
         Ok(results)

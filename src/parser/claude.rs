@@ -28,6 +28,12 @@ struct ClaudeLine {
     /// Meta message flag (slash command prompt expansions)
     #[serde(rename = "isMeta")]
     is_meta: Option<bool>,
+    /// User-set session title (preferred when present)
+    #[serde(rename = "customTitle")]
+    custom_title: Option<String>,
+    /// Auto-generated session title
+    #[serde(rename = "aiTitle")]
+    ai_title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +61,8 @@ impl SessionParser for ClaudeParser {
         let mut git_branch: Option<String> = None;
         let mut latest_timestamp: Option<DateTime<Utc>> = None;
         let mut messages: Vec<Message> = Vec::new();
+        let mut custom_title: Option<String> = None;
+        let mut ai_title: Option<String> = None;
 
         for line in reader.lines() {
             let line = line.context("Failed to read line")?;
@@ -66,6 +74,23 @@ impl SessionParser for ClaudeParser {
                 Ok(e) => e,
                 Err(_) => continue, // Skip malformed lines
             };
+
+            // Title entries: keep the latest non-empty value seen
+            match entry.entry_type.as_str() {
+                "custom-title" => {
+                    if let Some(t) = entry.custom_title.filter(|s| !s.is_empty()) {
+                        custom_title = Some(t);
+                    }
+                    continue;
+                }
+                "ai-title" => {
+                    if let Some(t) = entry.ai_title.filter(|s| !s.is_empty()) {
+                        ai_title = Some(t);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
 
             // Skip non-message entries
             if entry.entry_type != "user" && entry.entry_type != "assistant" {
@@ -150,6 +175,7 @@ impl SessionParser for ClaudeParser {
             cwd: cwd.unwrap_or_else(|| ".".to_string()),
             git_branch,
             timestamp: latest_timestamp.unwrap_or_else(Utc::now),
+            title: custom_title.or(ai_title),
             messages: join_consecutive_messages(messages),
         })
     }
