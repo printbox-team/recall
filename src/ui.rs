@@ -219,15 +219,36 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
             };
 
-            let mut header_spans = vec![
+            let header_spans = vec![
                 Span::styled("📁 ", header_style),
                 Span::styled(result.session.project_name(), header_style),
+                Span::styled("  ", header_style),
+                Span::styled(
+                    format!(
+                        "{} {}",
+                        result.session.source.icon(),
+                        result.session.source.display_name()
+                    ),
+                    Style::default().fg(source_color),
+                ),
+                Span::styled(format!("  {}", time_ago), header_style),
             ];
-            if let Some(title) = result.session.title.as_deref() {
-                header_spans.push(Span::styled(
-                    "  ▸ ",
-                    Style::default().fg(t.snippet_fg),
-                ));
+
+            // Title line (when present) — own row, italic, truncated to width.
+            let title_line: Option<Line> = result.session.title.as_deref().map(|title| {
+                let title_chars: Vec<char> = title.chars().collect();
+                // Reserve for "▸ " prefix (2 cells) and possible "…" suffix (1).
+                let max_title_chars = available_width.saturating_sub(3);
+                let display_title: String = if title_chars.len() > max_title_chars {
+                    let mut s: String = title_chars
+                        .iter()
+                        .take(max_title_chars.saturating_sub(1))
+                        .collect();
+                    s.push('…');
+                    s
+                } else {
+                    title.to_string()
+                };
                 let title_style = if is_selected {
                     Style::default()
                         .fg(t.selection_header_fg)
@@ -237,16 +258,11 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         .fg(t.snippet_fg)
                         .add_modifier(Modifier::ITALIC)
                 };
-                header_spans.push(Span::styled(title.to_string(), title_style));
-            }
-            header_spans.extend([
-                Span::styled("  ", header_style),
-                Span::styled(
-                    format!("{} {}", result.session.source.icon(), result.session.source.display_name()),
-                    Style::default().fg(source_color),
-                ),
-                Span::styled(format!("  {}", time_ago), header_style),
-            ]);
+                Line::from(vec![
+                    Span::styled("▸ ", Style::default().fg(t.snippet_fg)),
+                    Span::styled(display_title, title_style),
+                ])
+            });
 
             // Truncate snippet to fit available width (Tantivy already centered it)
             let snippet: String = result.snippet.chars().take(available_width).collect();
@@ -267,24 +283,27 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .collect();
             let snippet_spans = highlight_with_spans(&snippet, &adjusted_spans);
 
-            let lines = vec![
-                Line::from(header_spans),
-                Line::from(
-                    snippet_spans
-                        .into_iter()
-                        .map(|s| {
-                            if s.style.add_modifier.contains(Modifier::BOLD) {
-                                // Highlight for matches
-                                Span::styled(s.content, Style::default().fg(t.match_fg).add_modifier(Modifier::BOLD))
-                            } else {
-                                let fg = if is_selected { t.selection_snippet_fg } else { t.snippet_fg };
-                                Span::styled(s.content, Style::default().fg(fg))
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                Line::from(""), // Empty line between conversations
-            ];
+            let snippet_line = Line::from(
+                snippet_spans
+                    .into_iter()
+                    .map(|s| {
+                        if s.style.add_modifier.contains(Modifier::BOLD) {
+                            // Highlight for matches
+                            Span::styled(s.content, Style::default().fg(t.match_fg).add_modifier(Modifier::BOLD))
+                        } else {
+                            let fg = if is_selected { t.selection_snippet_fg } else { t.snippet_fg };
+                            Span::styled(s.content, Style::default().fg(fg))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+
+            let mut lines = vec![Line::from(header_spans)];
+            if let Some(title_line) = title_line {
+                lines.push(title_line);
+            }
+            lines.push(snippet_line);
+            lines.push(Line::from("")); // Empty line between conversations
 
             if is_selected {
                 ListItem::new(lines).style(Style::default().bg(t.selection_bg))
@@ -296,9 +315,10 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let list = List::new(items);
 
-    // Calculate visible items (each item is 3 lines: header, snippet, empty)
-    let lines_per_item = 3;
-    let visible_items = (area.height as usize) / lines_per_item;
+    // Each item is 3 lines (header, snippet, blank) + 1 if it has a title.
+    // Use the worst case (4) so scrolling never clips the selected row.
+    let max_lines_per_item = 4;
+    let visible_items = (area.height as usize) / max_lines_per_item;
 
     // Update scroll offset to keep selected item visible
     if app.selected < app.list_scroll {
