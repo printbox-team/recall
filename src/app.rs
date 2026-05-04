@@ -343,6 +343,48 @@ impl App {
         }
     }
 
+    /// Delete the word before the cursor (Alt+Backspace / Ctrl+W).
+    /// Eats trailing whitespace then the run of non-whitespace before it.
+    pub fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.query.chars().collect();
+        let mut new_cursor = self.cursor;
+        // Skip whitespace immediately to the left.
+        while new_cursor > 0 && chars[new_cursor - 1].is_whitespace() {
+            new_cursor -= 1;
+        }
+        // Then eat the word (run of non-whitespace).
+        while new_cursor > 0 && !chars[new_cursor - 1].is_whitespace() {
+            new_cursor -= 1;
+        }
+        if new_cursor == self.cursor {
+            return;
+        }
+        let start_byte = self
+            .query
+            .char_indices()
+            .nth(new_cursor)
+            .map(|(b, _)| b)
+            .unwrap_or(self.query.len());
+        let end_byte = self.cursor_byte_pos();
+        self.query.replace_range(start_byte..end_byte, "");
+        self.cursor = new_cursor;
+        self.mark_search_pending();
+    }
+
+    /// Delete from cursor to the start of the line (Ctrl+U).
+    pub fn delete_to_start(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end_byte = self.cursor_byte_pos();
+        self.query.replace_range(0..end_byte, "");
+        self.cursor = 0;
+        self.mark_search_pending();
+    }
+
     /// Clear search
     pub fn on_escape(&mut self) {
         if self.query.is_empty() {
@@ -890,5 +932,91 @@ mod tests {
         app.focus_next_message();
 
         assert!(app.pending_auto_scroll);
+    }
+
+    // ==================== Word/line deletion tests ====================
+
+    #[test]
+    fn test_delete_word_backward_simple() {
+        let mut app = test_app();
+        app.query = "foo bar baz".to_string();
+        app.cursor = app.query.chars().count();
+
+        app.delete_word_backward();
+
+        assert_eq!(app.query, "foo bar ");
+        assert_eq!(app.cursor, 8);
+    }
+
+    #[test]
+    fn test_delete_word_backward_eats_trailing_spaces() {
+        let mut app = test_app();
+        app.query = "foo bar   ".to_string();
+        app.cursor = app.query.chars().count();
+
+        app.delete_word_backward();
+
+        assert_eq!(app.query, "foo ");
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn test_delete_word_backward_at_start_noop() {
+        let mut app = test_app();
+        app.query = "foo".to_string();
+        app.cursor = 0;
+
+        app.delete_word_backward();
+
+        assert_eq!(app.query, "foo");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn test_delete_word_backward_unicode() {
+        let mut app = test_app();
+        app.query = "żółty rower".to_string();
+        app.cursor = app.query.chars().count();
+
+        app.delete_word_backward();
+
+        assert_eq!(app.query, "żółty ");
+        assert_eq!(app.cursor, 6);
+    }
+
+    #[test]
+    fn test_delete_word_backward_mid_word() {
+        let mut app = test_app();
+        app.query = "foo bar baz".to_string();
+        app.cursor = 6; // between 'a' and 'r' in "bar"
+
+        app.delete_word_backward();
+
+        assert_eq!(app.query, "foo r baz");
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn test_delete_to_start() {
+        let mut app = test_app();
+        app.query = "foo bar".to_string();
+        app.cursor = 5; // at the 'a' of "bar"
+
+        app.delete_to_start();
+
+        assert_eq!(app.query, "ar");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn test_delete_to_start_at_zero_noop() {
+        let mut app = test_app();
+        app.query = "foo".to_string();
+        app.cursor = 0;
+
+        app.delete_to_start();
+
+        assert_eq!(app.query, "foo");
+        assert_eq!(app.cursor, 0);
     }
 }

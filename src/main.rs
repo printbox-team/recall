@@ -220,7 +220,20 @@ fn run(terminal: &mut tui::Tui, app: &mut App) -> Result<()> {
                     KeyCode::Delete => app.on_delete(),
                     KeyCode::PageUp => app.focus_prev_message(),
                     KeyCode::PageDown => app.focus_next_message(),
+                    KeyCode::Backspace
+                        if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+                    {
+                        // Alt+Backspace (Unix-style word delete) and the
+                        // Cmd+Backspace some terminals forward as SUPER.
+                        app.delete_word_backward();
+                    }
                     KeyCode::Backspace => app.on_backspace(),
+                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.delete_word_backward();
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.delete_to_start();
+                    }
                     KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.toggle_focused_expansion();
                     }
