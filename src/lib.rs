@@ -1,5 +1,6 @@
 pub mod app;
 pub mod index;
+pub mod live;
 pub mod parser;
 pub mod session;
 pub mod theme;

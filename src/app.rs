@@ -1,12 +1,17 @@
 use crate::index::{discover_and_sort_files, index_files, IndexProgress, IndexState, SessionIndex};
+use crate::live::{self, LiveMap};
 use crate::parser;
 use crate::session::{SearchResult, Session};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Interval between background scans of `~/.claude/sessions/`.
+const LIVE_REFRESH: Duration = Duration::from_secs(3);
 
 /// Debounce delay for search (avoid searching on every keystroke during fast typing/paste)
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -83,6 +88,9 @@ pub struct App {
     last_input: Instant,
     /// Error from indexing thread (shown on exit)
     pub index_error: Option<String>,
+    /// Map of live (running) Claude Code sessions: session_id -> status.
+    /// Updated in the background every few seconds.
+    pub live_sessions: Arc<RwLock<LiveMap>>,
 }
 
 impl App {
@@ -115,6 +123,18 @@ impl App {
             background_index(index_path_clone, state_path, tx);
         });
 
+        // Live session detection: prime synchronously (cheap — at most a few
+        // small JSON files), then refresh in the background.
+        let live_sessions = Arc::new(RwLock::new(live::scan_live_sessions()));
+        let live_clone = Arc::clone(&live_sessions);
+        thread::spawn(move || loop {
+            thread::sleep(LIVE_REFRESH);
+            let next = live::scan_live_sessions();
+            if let Ok(mut guard) = live_clone.write() {
+                *guard = next;
+            }
+        });
+
         let initial_cursor = initial_query.chars().count();
         let mut app = Self {
             query: initial_query,
@@ -144,6 +164,7 @@ impl App {
             search_pending: false,
             last_input: Instant::now(),
             index_error: None,
+            live_sessions,
         };
 
         // If there's an initial query, run the search immediately
@@ -698,6 +719,7 @@ mod tests {
             search_pending: false,
             last_input: Instant::now(),
             index_error: None,
+            live_sessions: Arc::new(RwLock::new(LiveMap::new())),
         }
     }
 

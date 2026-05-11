@@ -1,4 +1,5 @@
 use crate::app::{App, SearchScope};
+use crate::live::{LiveMap, LiveStatus};
 use crate::session::{Role, SessionSource};
 use crate::theme::Theme;
 use ratatui::{
@@ -194,6 +195,13 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // Snapshot of live sessions for this frame (avoid locking per row).
+    let live_snapshot: LiveMap = app
+        .live_sessions
+        .read()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+
     let items: Vec<ListItem> = app
         .results
         .iter()
@@ -219,9 +227,24 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
             };
 
-            let header_spans = vec![
+            // Live "● " prefix (only Claude Code reports running processes today).
+            let live_status = if result.session.source == SessionSource::ClaudeCode {
+                live_snapshot.get(&result.session.id).copied()
+            } else {
+                None
+            };
+
+            let mut header_spans: Vec<Span<'static>> = Vec::new();
+            if let Some(status) = live_status {
+                let color = match status {
+                    LiveStatus::Idle => t.live_idle_fg,
+                    LiveStatus::Busy => t.live_busy_fg,
+                };
+                header_spans.push(Span::styled("● ", Style::default().fg(color)));
+            }
+            header_spans.extend([
                 Span::styled("📁 ", header_style),
-                Span::styled(result.session.project_name(), header_style),
+                Span::styled(result.session.project_name().to_string(), header_style),
                 Span::styled("  ", header_style),
                 Span::styled(
                     format!(
@@ -232,7 +255,7 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(source_color),
                 ),
                 Span::styled(format!("  {}", time_ago), header_style),
-            ];
+            ]);
 
             // Title line (when present) — own row, italic, truncated to width.
             let title_line: Option<Line> = result.session.title.as_deref().map(|title| {

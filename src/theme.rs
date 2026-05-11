@@ -54,6 +54,10 @@ pub struct Theme {
     pub scope_label_fg: Color,
     /// Focus indicator color (left border on focused message in preview)
     pub focus_indicator: Color,
+    /// "● running" dot for a live, idle Claude Code session
+    pub live_idle_fg: Color,
+    /// "● running" dot for a live, busy Claude Code session
+    pub live_busy_fg: Color,
 }
 
 impl Theme {
@@ -94,6 +98,8 @@ impl Theme {
             separator_fg: Color::Rgb(60, 60, 65),     // subtle separator
             scope_label_fg: Color::Rgb(140, 140, 140), // readable but not bright
             focus_indicator: Color::Rgb(100, 180, 255), // bright blue
+            live_idle_fg: Color::Rgb(80, 200, 120),     // green
+            live_busy_fg: Color::Rgb(255, 180, 50),     // amber
         }
     }
 
@@ -125,6 +131,8 @@ impl Theme {
             separator_fg: Color::Rgb(195, 195, 200),  // visible on light bg
             scope_label_fg: Color::Rgb(100, 100, 100), // readable on light bg
             focus_indicator: Color::Rgb(50, 120, 200), // darker blue for light bg
+            live_idle_fg: Color::Rgb(30, 150, 80),     // darker green for light bg
+            live_busy_fg: Color::Rgb(190, 120, 0),     // darker amber for light bg
         }
     }
 }

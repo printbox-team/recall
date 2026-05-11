@@ -1312,6 +1312,7 @@ dependencies = [
  "crossterm 0.28.1 (git+https://github.com/nornagon/crossterm?branch=nornagon%2Fcolor-query)",
  "dirs",
  "insta",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

@@ -25,6 +25,7 @@ clap = { version = "4", features = ["derive"] }
 # Utilities
 dirs = "5"
 walkdir = "2"
+libc = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "1"
