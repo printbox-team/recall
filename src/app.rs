@@ -269,8 +269,12 @@ impl App {
         if let Some(ref id) = selected_session_id {
             if let Some(pos) = self.results.iter().position(|r| &r.session.id == id) {
                 self.selected = pos;
-                // Scroll to keep selection visible (at top of list area)
-                self.list_scroll = pos;
+                // Keep the previous scroll offset, only pulling it up far enough
+                // that the selection is still visible. Forcing list_scroll to `pos`
+                // would scroll the selected row to the top of the viewport and hide
+                // higher-ranked results above it (the per-frame clamp in the renderer
+                // handles scrolling down when the selection falls below the viewport).
+                self.list_scroll = self.list_scroll.min(pos);
             } else {
                 self.selected = 0;
                 self.list_scroll = 0;
