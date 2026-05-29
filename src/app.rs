@@ -295,6 +295,11 @@ impl App {
             SearchScope::Folder(_) => SearchScope::Everything,
         };
         let _ = self.search();
+        // Changing scope reshuffles relevance, so jump focus to the top match
+        // rather than chasing the previously-selected session to its new position.
+        self.selected = 0;
+        self.list_scroll = 0;
+        self.update_preview_scroll();
     }
 
     /// Get the folder name for display (last component of path)
