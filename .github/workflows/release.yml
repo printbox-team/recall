@@ -102,8 +102,8 @@ jobs:
     name: Publish to WinGet
     needs: release
     runs-on: windows-latest
-    # Skip pre-release versions (e.g., v0.2.1-rc1)
-    if: ${{ !contains(github.ref_name, '-') }}
+    # Upstream-only (needs WINGET_TOKEN); skip pre-release versions (e.g., v0.2.1-rc1)
+    if: ${{ github.repository == 'zippoxer/recall' && !contains(github.ref_name, '-') }}
     steps:
       - uses: vedantmgoyal9/winget-releaser@v2
         with:
@@ -115,15 +115,15 @@ jobs:
     name: Publish to Homebrew
     needs: release
     runs-on: ubuntu-latest
-    # Skip pre-release versions (e.g., v0.2.1-rc1)
-    if: ${{ !contains(github.ref_name, '-') }}
+    # Upstream-only (needs HOMEBREW_TAP_TOKEN); skip pre-release versions (e.g., v0.2.1-rc1)
+    if: ${{ github.repository == 'zippoxer/recall' && !contains(github.ref_name, '-') }}
     steps:
       - name: Download release assets
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p assets
           cd assets
-          gh release download "$GITHUB_REF_NAME" -R zippoxer/recall \
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
             --pattern "recall-macos-intel.tar.gz" \
             --pattern "recall-macos-arm64.tar.gz" \
             --pattern "recall-linux-x86_64.tar.gz"
