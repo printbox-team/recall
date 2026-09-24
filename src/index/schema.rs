@@ -5,7 +5,19 @@ use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
+use tantivy::{doc, DocId, Index, IndexReader, IndexWriter, ReloadPolicy, Score, SegmentReader};
+
+/// Age at which a session's recency boost drops to half its peak.
+const RECENCY_HALF_LIFE_SECS: f64 = 14.0 * 24.0 * 3600.0;
+/// Peak extra weight for a session active right now (multiplier `1 + RECENCY_MAX_BOOST`).
+const RECENCY_MAX_BOOST: f64 = 2.0;
+
+/// Relevance multiplier for a session last active `age_secs` ago:
+/// 3x for a session active now, 2x at 14 days, 1.5x at 28 days, approaching 1x.
+fn recency_multiplier(age_secs: f64) -> Score {
+    let age = age_secs.max(0.0);
+    (1.0 + RECENCY_MAX_BOOST * (-age / RECENCY_HALF_LIFE_SECS).exp2()) as Score
+}
 
 /// Get the default cache directory for the index
 pub fn default_index_path() -> PathBuf {
@@ -218,8 +230,24 @@ impl SessionIndex {
             SnippetGenerator::create(&searcher, &*query, self.content)?;
         snippet_generator.set_max_num_chars(200);
 
-        // Get more results than limit to group by session
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit * 10))?;
+        // Get more results than limit to group by session. Recency is applied inside
+        // the collector so recent sessions compete for the candidate pool instead of
+        // being crowded out by older sessions that repeat the term more often.
+        let now = chrono::Utc::now().timestamp();
+        let collector = TopDocs::with_limit(limit * 20).tweak_score(
+            move |segment_reader: &SegmentReader| {
+                let timestamps = segment_reader
+                    .fast_fields()
+                    .i64("timestamp")
+                    .expect("timestamp is a fast field")
+                    .first_or_default_col(now);
+                move |doc: DocId, score: Score| {
+                    let age_secs = (now - timestamps.get_val(doc)) as f64;
+                    score * recency_multiplier(age_secs)
+                }
+            },
+        );
+        let top_docs = searcher.search(&query, &collector)?;
 
         // Group by session, keeping track of the highest-scoring message per session
         let mut session_results: std::collections::HashMap<String, (f32, SearchResult)> =
@@ -322,25 +350,9 @@ impl SessionIndex {
                 .or_insert((score, result));
         }
 
-        // Sort by combined relevance + recency score
-        // Recency boost: exponential decay with ~7 day half-life
-        let now = chrono::Utc::now().timestamp() as f64;
-        let half_life_secs = 7.0 * 24.0 * 3600.0; // 7 days
-
+        // Scores already include the recency multiplier
         let mut results: Vec<_> = session_results.into_values().map(|(_, r)| r).collect();
-        results.sort_by(|a, b| {
-            let age_a = (now - a.session.timestamp.timestamp() as f64).max(0.0);
-            let age_b = (now - b.session.timestamp.timestamp() as f64).max(0.0);
-
-            // Exponential decay: recent sessions get boost up to 2x
-            let recency_a = 1.0 + (-age_a / half_life_secs).exp();
-            let recency_b = 1.0 + (-age_b / half_life_secs).exp();
-
-            let final_a = (a.score as f64) * recency_a;
-            let final_b = (b.score as f64) * recency_b;
-
-            final_b.partial_cmp(&final_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
 
         Ok(results)
@@ -482,3 +494,68 @@ impl SessionIndex {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Message, Role};
+    use chrono::{Duration, Utc};
+
+    fn session(id: &str, age_days: i64, contents: &[&str]) -> Session {
+        let timestamp = Utc::now() - Duration::days(age_days);
+        Session {
+            id: id.to_string(),
+            source: SessionSource::ClaudeCode,
+            file_path: PathBuf::from(format!("/sessions/{id}.jsonl")),
+            cwd: "/project".to_string(),
+            git_branch: None,
+            timestamp,
+            title: None,
+            messages: contents
+                .iter()
+                .map(|c| Message {
+                    role: Role::User,
+                    content: c.to_string(),
+                    timestamp,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn recency_multiplier_halves_boost_every_half_life() {
+        let day = 24.0 * 3600.0;
+        assert!((recency_multiplier(0.0) - 3.0).abs() < 1e-4);
+        assert!((recency_multiplier(14.0 * day) - 2.0).abs() < 1e-4);
+        assert!((recency_multiplier(28.0 * day) - 1.5).abs() < 1e-4);
+        assert!((recency_multiplier(-day) - 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn recent_session_is_not_crowded_out_by_older_sessions_repeating_the_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SessionIndex::open_or_create(dir.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+
+        // Old sessions whose many messages all match strongly fill a BM25-only
+        // candidate pool (limit * 20 docs) before the recent session gets in.
+        let heavy = ["deploy deploy deploy"; 20];
+        for i in 0..3 {
+            index
+                .index_session(&mut writer, &session(&format!("old-{i}"), 365, &heavy))
+                .unwrap();
+        }
+        index
+            .index_session(
+                &mut writer,
+                &session("recent", 0, &["let's deploy the fix to staging now"]),
+            )
+            .unwrap();
+        writer.commit().unwrap();
+        index.reload().unwrap();
+
+        let results = index.search("deploy", 2).unwrap();
+
+        assert_eq!(results[0].session.id, "recent");
+    }
+}
