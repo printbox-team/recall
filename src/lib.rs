@@ -1,4 +1,5 @@
 pub mod app;
+pub mod fold;
 pub mod index;
 pub mod live;
 pub mod parser;

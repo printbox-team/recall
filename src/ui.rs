@@ -1,4 +1,5 @@
 use crate::app::{App, SearchScope};
+use crate::fold::find_folded;
 use crate::live::{LiveMap, LiveStatus};
 use crate::session::{Role, SessionSource};
 use crate::theme::Theme;
@@ -779,14 +780,12 @@ fn highlight_with_spans(text: &str, spans: &[(usize, usize)]) -> Vec<Span<'stati
 }
 
 /// Highlight query matches, returning owned Spans (for use with local variables)
-/// Splits query into words and highlights each word separately
+/// Splits query into words and highlights each word separately, ignoring case and diacritics
 fn highlight_matches_owned(text: &str, query: &str) -> Vec<Span<'static>> {
     let t = theme();
     if query.is_empty() {
         return vec![Span::raw(text.to_owned())];
     }
-
-    let lower_text = text.to_lowercase();
 
     // Split query into words and find all match positions
     let query_words: Vec<&str> = query.split_whitespace().filter(|w| !w.is_empty()).collect();
@@ -795,22 +794,10 @@ fn highlight_matches_owned(text: &str, query: &str) -> Vec<Span<'static>> {
     }
 
     // Collect all match ranges (byte positions in original text)
-    let mut matches: Vec<(usize, usize)> = Vec::new();
-    for word in &query_words {
-        let lower_word = word.to_lowercase();
-        for (match_start_lower, matched_str) in lower_text.match_indices(&lower_word) {
-            let char_offset = lower_text[..match_start_lower].chars().count();
-            let start = text.char_indices().nth(char_offset).map(|(i, _)| i).unwrap_or(text.len());
-
-            let match_char_len = matched_str.chars().count();
-            let end = text[start..].char_indices()
-                .nth(match_char_len)
-                .map(|(i, _)| start + i)
-                .unwrap_or(text.len());
-
-            matches.push((start, end));
-        }
-    }
+    let mut matches: Vec<(usize, usize)> = query_words
+        .iter()
+        .flat_map(|word| find_folded(text, word))
+        .collect();
 
     // Sort by start position and merge overlapping ranges
     matches.sort_by_key(|m| m.0);

@@ -8,9 +8,15 @@ use tantivy::query::{
 };
 use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
+use tantivy::tokenizer::{
+    AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
+};
 use tantivy::{
     doc, DocId, Index, IndexReader, IndexWriter, ReloadPolicy, Score, Searcher, SegmentReader, Term,
 };
+
+/// Name of the text analyzer used for searchable fields and queries
+const ANALYZER: &str = "recall";
 
 /// Age at which a session's recency boost drops to half its peak.
 const RECENCY_HALF_LIFE_SECS: f64 = 14.0 * 24.0 * 3600.0;
@@ -26,6 +32,8 @@ fn recency_multiplier(age_secs: f64) -> Score {
 
 /// Title hits outrank the same words inside a message
 const TITLE_BOOST: Score = 5.0;
+/// A project or branch name match ranks above a passing mention in a message
+const PROJECT_BOOST: Score = 2.0;
 const CONTENT_PHRASE_BOOST: Score = 10.0;
 const TITLE_PHRASE_BOOST: Score = 50.0;
 
@@ -117,6 +125,7 @@ pub struct SessionIndex {
     timestamp: Field,
     content: Field,
     title: Field,
+    project: Field,
     message_index: Field,
 }
 
@@ -148,6 +157,8 @@ impl SessionIndex {
                 .context("Failed to create new index")?
         };
 
+        index.tokenizers().register(ANALYZER, Self::analyzer());
+
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -165,6 +176,7 @@ impl SessionIndex {
             timestamp: schema.get_field("timestamp").unwrap(),
             content: schema.get_field("content").unwrap(),
             title: schema.get_field("title").unwrap(),
+            project: schema.get_field("project").unwrap(),
             message_index: schema.get_field("message_index").unwrap(),
             schema,
         })
@@ -186,13 +198,35 @@ impl SessionIndex {
         // Message index within the session (for match-recency)
         builder.add_u64_field("message_index", STORED);
 
+        let searchable = TextFieldIndexing::default()
+            .set_tokenizer(ANALYZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+
         // Searchable content field
-        builder.add_text_field("content", TEXT | STORED);
+        builder.add_text_field(
+            "content",
+            TextOptions::default().set_indexing_options(searchable.clone()).set_stored(),
+        );
 
         // Searchable session title (custom-title / ai-title for Claude, title for Factory/OpenCode)
-        builder.add_text_field("title", TEXT | STORED);
+        builder.add_text_field(
+            "title",
+            TextOptions::default().set_indexing_options(searchable.clone()).set_stored(),
+        );
+
+        // Project folder name and git branch, so a session can be found by where it ran
+        builder.add_text_field("project", TextOptions::default().set_indexing_options(searchable));
 
         builder.build()
+    }
+
+    /// Word splitting + lowercase + diacritic folding, so "blad" matches "błąd"
+    fn analyzer() -> TextAnalyzer {
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(40))
+            .filter(LowerCaser)
+            .filter(AsciiFoldingFilter)
+            .build()
     }
 
     /// Get a writer for indexing operations
@@ -206,6 +240,11 @@ impl SessionIndex {
     pub fn index_session(&self, writer: &mut IndexWriter, session: &Session) -> Result<()> {
         let timestamp_secs = session.timestamp.timestamp();
         let title = session.title.clone().unwrap_or_default();
+        let project = format!(
+            "{} {}",
+            session.project_name(),
+            session.git_branch.as_deref().unwrap_or_default()
+        );
 
         // Index each message separately for match-recency ranking.
         // Title is duplicated on each message doc so a title hit returns any
@@ -221,6 +260,7 @@ impl SessionIndex {
                 self.message_index => idx as u64,
                 self.content => message.content.clone(),
                 self.title => title.clone(),
+                self.project => project.clone(),
             );
             writer.add_document(doc)?;
         }
@@ -398,21 +438,25 @@ impl SessionIndex {
     /// to index content, so query terms match indexed terms.
     fn tokenize_query(&self, query_str: &str) -> Vec<(usize, String)> {
         let mut tokens = Vec::new();
-        if let Some(mut analyzer) = self.index.tokenizers().get("default") {
+        if let Some(mut analyzer) = self.index.tokenizers().get(ANALYZER) {
             let mut stream = analyzer.token_stream(query_str);
             stream.process(&mut |token| tokens.push((token.position, token.text.clone())));
         }
         tokens
     }
 
-    /// Match one query word in content and title: the exact term, plus the most
+    /// Match one query word in content, title and project: the exact term, plus the most
     /// frequent terms it is a prefix of (weighted lower) so half-typed words match.
     /// Per field the best alternative counts, so a short prefix doesn't add up
     /// the scores of every word it expands to.
     fn word_query(&self, searcher: &Searcher, word: &str) -> Result<Box<dyn Query>> {
         let word_chars = word.chars().count();
         let mut fields: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        for (field, field_boost) in [(self.content, 1.0), (self.title, TITLE_BOOST)] {
+        for (field, field_boost) in [
+            (self.content, 1.0),
+            (self.title, TITLE_BOOST),
+            (self.project, PROJECT_BOOST),
+        ] {
             let mut alternatives = vec![term_query(field, word, 1.0)];
             for term in expand_prefix(searcher, field, word, prefix_expansion_limit(word_chars))? {
                 let weight = PREFIX_WEIGHT * word_chars as f32 / term.chars().count() as f32;
@@ -645,6 +689,29 @@ mod tests {
         let results = index.search("recency boo", 10).unwrap();
 
         assert_eq!(ids(&results)[0], "phrase");
+    }
+
+    #[test]
+    fn query_without_diacritics_matches_and_highlights_polish_words() {
+        let (_dir, index) = index_with(&[session("a", 1, &["Znalazłem błąd w zamówieniu"])]);
+
+        let results = index.search("blad zamowie", 10).unwrap();
+
+        assert_eq!(ids(&results), ["a"]);
+        let r = &results[0];
+        let highlighted: Vec<&str> = r.match_spans.iter().map(|&(s, e)| &r.snippet[s..e]).collect();
+        assert_eq!(highlighted, ["błąd", "zamówieniu"]);
+    }
+
+    #[test]
+    fn session_is_found_by_project_folder_and_git_branch() {
+        let mut in_project = session("in-project", 1, &["fixed the flaky test"]);
+        in_project.cwd = "/Users/me/Projects/printbox-editor".to_string();
+        in_project.git_branch = Some("feature/PBX-72802-cart".to_string());
+        let (_dir, index) = index_with(&[in_project, session("other", 1, &["fixed the flaky test"])]);
+
+        assert_eq!(ids(&index.search("printbox", 10).unwrap()), ["in-project"]);
+        assert_eq!(ids(&index.search("72802", 10).unwrap()), ["in-project"]);
     }
 
     #[test]

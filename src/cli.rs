@@ -3,6 +3,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use recall::{
+    fold::fold,
     index::{ensure_index_fresh, SessionIndex},
     parser,
     session::{ListOutput, Message, SearchOutput, SearchResultOutput, SessionSource},
@@ -37,7 +38,7 @@ pub fn run_search(
     let results = index.search(query, limit * 2)?; // Get more to filter
 
     // Pre-compute query terms once (not per-session)
-    let query_lower = query.to_lowercase();
+    let query_lower = fold(query);
     let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
 
     // Convert to output format
@@ -58,13 +59,13 @@ pub fn run_search(
                 let session = parser::parse_session_file(&r.session.file_path)
                     .unwrap_or(r.session.clone());
 
-                // Filter and score messages in one pass (avoids repeated to_lowercase in sort)
+                // Filter and score messages in one pass (avoids repeated folding in sort)
                 let mut scored_messages: Vec<(usize, usize, &Message)> = session
                     .messages
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, m)| {
-                        let content_lower = m.content.to_lowercase();
+                        let content_lower = fold(&m.content);
                         let score: usize = query_terms
                             .iter()
                             .map(|t| content_lower.matches(t).count())
@@ -134,16 +135,16 @@ fn search_in_session(
 
     let session = parser::parse_session_file(&file_path)?;
 
-    let query_lower = query.to_lowercase();
+    let query_lower = fold(query);
     let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
 
-    // Filter and score messages in one pass (avoids repeated to_lowercase in sort)
+    // Filter and score messages in one pass (avoids repeated folding in sort)
     let mut scored_messages: Vec<(usize, usize, &Message)> = session
         .messages
         .iter()
         .enumerate()
         .filter_map(|(idx, m)| {
-            let content_lower = m.content.to_lowercase();
+            let content_lower = fold(&m.content);
             let score: usize = query_terms
                 .iter()
                 .map(|t| content_lower.matches(t).count())

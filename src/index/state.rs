@@ -21,7 +21,7 @@ impl IndexState {
     /// Bump whenever the Tantivy schema or parser output changes in a way that
     /// invalidates previously-indexed documents. `migrate_if_needed` wipes the
     /// index dir + state file when the on-disk version doesn't match.
-    const CURRENT_VERSION: u32 = 2;
+    const CURRENT_VERSION: u32 = 3;
 
     /// Load state from disk or create new
     pub fn load(state_path: &Path) -> Result<Self> {
