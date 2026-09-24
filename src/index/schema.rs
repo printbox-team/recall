@@ -1,11 +1,16 @@
 use crate::session::{SearchResult, Session, SessionSource};
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, QueryParser, TermQuery};
+use tantivy::query::{
+    BooleanQuery, BoostQuery, DisjunctionMaxQuery, Occur, PhrasePrefixQuery, Query, TermQuery,
+};
 use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
-use tantivy::{doc, DocId, Index, IndexReader, IndexWriter, ReloadPolicy, Score, SegmentReader};
+use tantivy::{
+    doc, DocId, Index, IndexReader, IndexWriter, ReloadPolicy, Score, Searcher, SegmentReader, Term,
+};
 
 /// Age at which a session's recency boost drops to half its peak.
 const RECENCY_HALF_LIFE_SECS: f64 = 14.0 * 24.0 * 3600.0;
@@ -17,6 +22,72 @@ const RECENCY_MAX_BOOST: f64 = 2.0;
 fn recency_multiplier(age_secs: f64) -> Score {
     let age = age_secs.max(0.0);
     (1.0 + RECENCY_MAX_BOOST * (-age / RECENCY_HALF_LIFE_SECS).exp2()) as Score
+}
+
+/// Title hits outrank the same words inside a message
+const TITLE_BOOST: Score = 5.0;
+const CONTENT_PHRASE_BOOST: Score = 10.0;
+const TITLE_PHRASE_BOOST: Score = 50.0;
+
+/// Score of a prefix expansion relative to an exact match, scaled further by how
+/// much of the expanded word was typed ("recenc" -> "recency" scores higher than
+/// "rec" -> "recency").
+const PREFIX_WEIGHT: Score = 0.5;
+const MAX_PREFIX_EXPANSIONS: usize = 64;
+
+/// How many terms a typed word expands to: none for a single character (it would
+/// match nearly everything), a few for two characters, the most frequent 64 beyond.
+fn prefix_expansion_limit(word_chars: usize) -> usize {
+    match word_chars {
+        0 | 1 => 0,
+        2 => 16,
+        _ => MAX_PREFIX_EXPANSIONS,
+    }
+}
+
+fn term_query(field: Field, text: &str, boost: Score) -> Box<dyn Query> {
+    let query = TermQuery::new(Term::from_field_text(field, text), IndexRecordOption::WithFreqs);
+    Box::new(BoostQuery::new(Box::new(query), boost))
+}
+
+/// Smallest byte string greater than every string starting with `prefix`
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(last) = bound.pop() {
+        if last != u8::MAX {
+            bound.push(last + 1);
+            return Some(bound);
+        }
+    }
+    None
+}
+
+/// Indexed terms of `field` that start with `prefix` (excluding `prefix` itself),
+/// the `limit` most frequent first.
+fn expand_prefix(searcher: &Searcher, field: Field, prefix: &str, limit: usize) -> Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut doc_freqs: HashMap<Vec<u8>, u32> = HashMap::new();
+    for segment in searcher.segment_readers() {
+        let inverted_index = segment.inverted_index(field)?;
+        let terms = inverted_index.terms();
+        let mut range = terms.range().gt(prefix.as_bytes());
+        if let Some(upper) = prefix_upper_bound(prefix.as_bytes()) {
+            range = range.lt(upper);
+        }
+        let mut stream = range.into_stream()?;
+        while stream.advance() {
+            *doc_freqs.entry(stream.key().to_vec()).or_default() += stream.value().doc_freq;
+        }
+    }
+    let mut expansions: Vec<(Vec<u8>, u32)> = doc_freqs.into_iter().collect();
+    expansions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(expansions
+        .into_iter()
+        .take(limit)
+        .filter_map(|(term, _)| String::from_utf8(term).ok())
+        .collect())
 }
 
 /// Get the default cache directory for the index
@@ -179,51 +250,31 @@ impl SessionIndex {
         }
 
         let searcher = self.reader.searcher();
-        let mut query_parser =
-            QueryParser::for_index(&self.index, vec![self.content, self.title]);
-        // Boost title hits so a query that matches a session name ranks above a
-        // session that only contains the same words inside a message.
-        query_parser.set_field_boost(self.title, 5.0);
+        let tokens = self.tokenize_query(query_str);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let base_query = query_parser
-            .parse_query(query_str)
-            .context("Failed to parse query")?;
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for (_, word) in &tokens {
+            clauses.push((Occur::Should, self.word_query(&searcher, word)?));
+        }
 
-        // Boost exact phrase matches for multi-word queries
-        // Use the same tokenizer that indexed the content to tokenize the query
-        let query: Box<dyn Query> = if let Some(mut tokenizer) = self.index.tokenizers().get("default") {
-            let mut content_terms: Vec<(usize, tantivy::Term)> = Vec::new();
-            let mut title_terms: Vec<(usize, tantivy::Term)> = Vec::new();
-            let mut token_stream = tokenizer.token_stream(query_str);
-            token_stream.process(&mut |token| {
-                content_terms.push((
-                    token.position,
-                    tantivy::Term::from_field_text(self.content, &token.text),
-                ));
-                title_terms.push((
-                    token.position,
-                    tantivy::Term::from_field_text(self.title, &token.text),
-                ));
-            });
-
-            if content_terms.len() > 1 {
-                let content_phrase = PhraseQuery::new_with_offset(content_terms);
-                let title_phrase = PhraseQuery::new_with_offset(title_terms);
-                let boosted_content_phrase = BoostQuery::new(Box::new(content_phrase), 10.0);
-                let boosted_title_phrase = BoostQuery::new(Box::new(title_phrase), 50.0);
-
-                // Combine: title-phrase OR content-phrase OR terms
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Should, Box::new(boosted_title_phrase) as Box<dyn Query>),
-                    (Occur::Should, Box::new(boosted_content_phrase) as Box<dyn Query>),
-                    (Occur::Should, base_query),
-                ]))
-            } else {
-                base_query
+        // Boost phrase matches for multi-word queries; the last word may still be
+        // half-typed, so it matches as a prefix.
+        if tokens.len() > 1 {
+            for (field, boost) in [(self.content, CONTENT_PHRASE_BOOST), (self.title, TITLE_PHRASE_BOOST)] {
+                let terms = tokens
+                    .iter()
+                    .map(|(position, word)| (*position, Term::from_field_text(field, word)))
+                    .collect();
+                let mut phrase = PhrasePrefixQuery::new_with_offset(terms);
+                phrase.set_max_expansions(MAX_PREFIX_EXPANSIONS as u32);
+                clauses.push((Occur::Should, Box::new(BoostQuery::new(Box::new(phrase), boost))));
             }
-        } else {
-            base_query
-        };
+        }
+
+        let query: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
 
         // Get more results than limit to group by session. Recency is applied inside
         // the collector so recent sessions compete for the candidate pool instead of
@@ -341,6 +392,36 @@ impl SessionIndex {
             match_spans,
             match_fragment,
         }
+    }
+
+    /// Split the query into (position, term text) tokens with the analyzer used
+    /// to index content, so query terms match indexed terms.
+    fn tokenize_query(&self, query_str: &str) -> Vec<(usize, String)> {
+        let mut tokens = Vec::new();
+        if let Some(mut analyzer) = self.index.tokenizers().get("default") {
+            let mut stream = analyzer.token_stream(query_str);
+            stream.process(&mut |token| tokens.push((token.position, token.text.clone())));
+        }
+        tokens
+    }
+
+    /// Match one query word in content and title: the exact term, plus the most
+    /// frequent terms it is a prefix of (weighted lower) so half-typed words match.
+    /// Per field the best alternative counts, so a short prefix doesn't add up
+    /// the scores of every word it expands to.
+    fn word_query(&self, searcher: &Searcher, word: &str) -> Result<Box<dyn Query>> {
+        let word_chars = word.chars().count();
+        let mut fields: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for (field, field_boost) in [(self.content, 1.0), (self.title, TITLE_BOOST)] {
+            let mut alternatives = vec![term_query(field, word, 1.0)];
+            for term in expand_prefix(searcher, field, word, prefix_expansion_limit(word_chars))? {
+                let weight = PREFIX_WEIGHT * word_chars as f32 / term.chars().count() as f32;
+                alternatives.push(term_query(field, &term, weight));
+            }
+            let best = DisjunctionMaxQuery::with_tie_breaker(alternatives, 0.1);
+            fields.push((Occur::Should, Box::new(BoostQuery::new(Box::new(best), field_boost))));
+        }
+        Ok(Box::new(BooleanQuery::new(fields)))
     }
 
     /// Get recent sessions sorted by timestamp (most recent first)
@@ -505,6 +586,65 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn index_with(sessions: &[Session]) -> (tempfile::TempDir, SessionIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SessionIndex::open_or_create(dir.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for s in sessions {
+            index.index_session(&mut writer, s).unwrap();
+        }
+        writer.commit().unwrap();
+        index.reload().unwrap();
+        (dir, index)
+    }
+
+    fn ids(results: &[SearchResult]) -> Vec<&str> {
+        results.iter().map(|r| r.session.id.as_str()).collect()
+    }
+
+    #[test]
+    fn half_typed_word_matches_and_highlights_the_full_word() {
+        let (_dir, index) = index_with(&[session("a", 1, &["tuning the recency boost"])]);
+
+        let results = index.search("recenc", 10).unwrap();
+
+        assert_eq!(ids(&results), ["a"]);
+        let r = &results[0];
+        let highlighted: Vec<&str> = r.match_spans.iter().map(|&(s, e)| &r.snippet[s..e]).collect();
+        assert_eq!(highlighted, ["recency"]);
+    }
+
+    #[test]
+    fn exact_word_outranks_a_longer_word_it_prefixes() {
+        let (_dir, index) = index_with(&[
+            session("prefix", 1, &["running the testing suite"]),
+            session("exact", 1, &["running the test suite"]),
+        ]);
+
+        let results = index.search("test", 10).unwrap();
+
+        assert_eq!(ids(&results), ["exact", "prefix"]);
+    }
+
+    #[test]
+    fn single_character_does_not_expand_to_every_word() {
+        let (_dir, index) = index_with(&[session("a", 1, &["recall search"])]);
+
+        assert!(index.search("r", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn half_typed_last_word_still_gets_the_phrase_boost() {
+        let (_dir, index) = index_with(&[
+            session("scattered", 1, &["boost the index by recency"]),
+            session("phrase", 1, &["so the recency boost works well enough for older sessions too"]),
+        ]);
+
+        let results = index.search("recency boo", 10).unwrap();
+
+        assert_eq!(ids(&results)[0], "phrase");
     }
 
     #[test]
