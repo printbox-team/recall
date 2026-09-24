@@ -225,11 +225,6 @@ impl SessionIndex {
             base_query
         };
 
-        // Create snippet generator from the query - Tantivy knows what terms matched
-        let mut snippet_generator =
-            SnippetGenerator::create(&searcher, &*query, self.content)?;
-        snippet_generator.set_max_num_chars(200);
-
         // Get more results than limit to group by session. Recency is applied inside
         // the collector so recent sessions compete for the candidate pool instead of
         // being crowded out by older sessions that repeat the term more often.
@@ -249,113 +244,103 @@ impl SessionIndex {
         );
         let top_docs = searcher.search(&query, &collector)?;
 
-        // Group by session, keeping track of the highest-scoring message per session
-        let mut session_results: std::collections::HashMap<String, (f32, SearchResult)> =
+        // Group by session, keeping the best-scoring message per session.
+        // Scores already include the recency multiplier.
+        let mut best_per_session: std::collections::HashMap<String, (f32, f32, TantivyDocument)> =
             std::collections::HashMap::new();
-
         for (score, doc_addr) in top_docs {
-            let doc: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
-
+            let doc: TantivyDocument = searcher.doc(doc_addr)?;
             let session_id = doc
                 .get_first(self.session_id)
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-
-            let source_str = doc
-                .get_first(self.source)
-                .and_then(|v| v.as_str())
-                .unwrap_or("claude");
-
-            let source = SessionSource::parse(source_str).unwrap_or(SessionSource::ClaudeCode);
-
-            let file_path = doc
-                .get_first(self.file_path)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let cwd = doc
-                .get_first(self.cwd)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let git_branch = doc
-                .get_first(self.git_branch)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
-
-            let timestamp_secs = doc
-                .get_first(self.timestamp)
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-
             let message_index = doc
                 .get_first(self.message_index)
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+                .unwrap_or(0);
 
-            let title = doc
-                .get_first(self.title)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
-
-            // Use Tantivy's SnippetGenerator for accurate snippet with highlights
-            let tantivy_snippet = snippet_generator.snippet_from_doc(&doc);
-            let fragment = tantivy_snippet.fragment();
-            let highlighted = tantivy_snippet.highlighted();
-
-            // Store original fragment for finding match in wrapped text
-            let match_fragment = fragment.to_string();
-            let snippet = fragment.replace('\n', " ");
-            let match_spans: Vec<(usize, usize)> = highlighted
-                .iter()
-                .map(|r| (r.start, r.end))
-                .collect();
-
-            let result = SearchResult {
-                session: Session {
-                    id: session_id.clone(),
-                    source,
-                    file_path: std::path::PathBuf::from(&file_path),
-                    cwd,
-                    git_branch,
-                    timestamp: chrono::DateTime::from_timestamp(timestamp_secs, 0)
-                        .unwrap_or_default(),
-                    title,
-                    messages: Vec::new(), // We don't load all messages for search results
-                },
-                score,
-                matched_message_index: message_index,
-                snippet,
-                match_spans,
-                match_fragment,
-            };
-
-            // Keep the highest-scoring result for each session
-            // But prefer more recent message indices (higher = more recent)
-            session_results
-                .entry(session_id)
-                .and_modify(|(existing_score, existing_result)| {
-                    // Prefer higher message index (more recent) if scores are similar
-                    let recency_bonus = (message_index as f32) * 0.01;
-                    if score + recency_bonus > *existing_score {
-                        *existing_score = score + recency_bonus;
-                        *existing_result = result.clone();
+            // Among similarly scored messages prefer the later one in the session
+            let rank = score + (message_index as f32) * 0.01;
+            match best_per_session.entry(session_id) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if rank > e.get().0 {
+                        e.insert((rank, score, doc));
                     }
-                })
-                .or_insert((score, result));
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((rank, score, doc));
+                }
+            }
         }
 
-        // Scores already include the recency multiplier
-        let mut results: Vec<_> = session_results.into_values().map(|(_, r)| r).collect();
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(limit);
+        let mut best: Vec<_> = best_per_session.into_values().collect();
+        best.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        best.truncate(limit);
+
+        // Snippets are only built for the sessions that are actually returned
+        let mut snippet_generator = SnippetGenerator::create(&searcher, &*query, self.content)?;
+        snippet_generator.set_max_num_chars(200);
+
+        let results = best
+            .into_iter()
+            .map(|(_, score, doc)| self.search_result(&doc, score, &snippet_generator))
+            .collect();
 
         Ok(results)
+    }
+
+    /// Build a search result from a matched message doc, with a highlighted snippet
+    fn search_result(
+        &self,
+        doc: &TantivyDocument,
+        score: f32,
+        snippet_generator: &SnippetGenerator,
+    ) -> SearchResult {
+        let text = |field: Field| {
+            doc.get_first(field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let non_empty = |s: String| Some(s).filter(|s| !s.is_empty());
+
+        let source = SessionSource::parse(&text(self.source)).unwrap_or(SessionSource::ClaudeCode);
+        let timestamp_secs = doc
+            .get_first(self.timestamp)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let message_index = doc
+            .get_first(self.message_index)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let tantivy_snippet = snippet_generator.snippet_from_doc(doc);
+        let match_fragment = tantivy_snippet.fragment().to_string();
+        let snippet = match_fragment.replace('\n', " ");
+        let match_spans = tantivy_snippet
+            .highlighted()
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+
+        SearchResult {
+            session: Session {
+                id: text(self.session_id),
+                source,
+                file_path: PathBuf::from(text(self.file_path)),
+                cwd: text(self.cwd),
+                git_branch: non_empty(text(self.git_branch)),
+                timestamp: chrono::DateTime::from_timestamp(timestamp_secs, 0).unwrap_or_default(),
+                title: non_empty(text(self.title)),
+                messages: Vec::new(), // We don't load all messages for search results
+            },
+            score,
+            matched_message_index: message_index,
+            snippet,
+            match_spans,
+            match_fragment,
+        }
     }
 
     /// Get recent sessions sorted by timestamp (most recent first)

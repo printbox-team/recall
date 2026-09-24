@@ -683,6 +683,10 @@ fn background_index(index_path: PathBuf, state_path: PathBuf, tx: Sender<IndexMs
 
     let _ = state.save(&state_path);
 
+    // Let the merges triggered by the commits finish; dropping the writer would
+    // abandon them and leave the index fragmented into many small segments.
+    let _ = writer.wait_merging_threads();
+
     let _ = tx.send(IndexMsg::Done {
         total_sessions: files.len(),
     });

@@ -61,6 +61,10 @@ pub fn ensure_index_fresh(index: &SessionIndex) -> Result<()> {
 
     state.save(&state_path)?;
 
+    // Let the merges triggered by the commits finish; dropping the writer would
+    // abandon them and leave the index fragmented into many small segments.
+    writer.wait_merging_threads()?;
+
     // Clear progress line and print completion
     eprintln!(
         "\rIndexed {} session{}.    ",
