@@ -11,6 +11,8 @@ crossterm = { git = "https://github.com/nornagon/crossterm", branch = "nornagon/
 
 # Search
 tantivy = "0.22"
+tantivy-fst = "0.5"
+levenshtein_automata = "0.2"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

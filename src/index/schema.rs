@@ -1,13 +1,16 @@
 use crate::session::{SearchResult, Session, SessionSource};
 use anyhow::{Context, Result};
+use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tantivy::collector::TopDocs;
 use tantivy::query::{
     BooleanQuery, BoostQuery, DisjunctionMaxQuery, Occur, PhrasePrefixQuery, Query, TermQuery,
 };
 use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
+use tantivy_fst::Automaton;
 use tantivy::tokenizer::{
     AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
 };
@@ -89,13 +92,7 @@ fn expand_prefix(searcher: &Searcher, field: Field, prefix: &str, limit: usize) 
             *doc_freqs.entry(stream.key().to_vec()).or_default() += stream.value().doc_freq;
         }
     }
-    let mut expansions: Vec<(Vec<u8>, u32)> = doc_freqs.into_iter().collect();
-    expansions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    Ok(expansions
-        .into_iter()
-        .take(limit)
-        .filter_map(|(term, _)| String::from_utf8(term).ok())
-        .collect())
+    Ok(most_frequent(doc_freqs, limit))
 }
 
 /// Get the default cache directory for the index
@@ -295,9 +292,26 @@ impl SessionIndex {
             return Ok(Vec::new());
         }
 
+        let results = self.search_tokens(&searcher, &tokens, limit, false)?;
+
+        // Only when exact and prefix matches come up short, retry allowing typos
+        let typo_tolerant = tokens.iter().any(|(_, word)| typo_distance(word.chars().count()) > 0);
+        if results.len() >= TYPO_FALLBACK_MIN_SESSIONS || !typo_tolerant {
+            return Ok(results);
+        }
+        self.search_tokens(&searcher, &tokens, limit, true)
+    }
+
+    fn search_tokens(
+        &self,
+        searcher: &Searcher,
+        tokens: &[(usize, String)],
+        limit: usize,
+        with_typos: bool,
+    ) -> Result<Vec<SearchResult>> {
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        for (_, word) in &tokens {
-            clauses.push((Occur::Should, self.word_query(&searcher, word)?));
+        for (_, word) in tokens {
+            clauses.push((Occur::Should, self.word_query(searcher, word, with_typos)?));
         }
 
         // Boost phrase matches for multi-word queries; the last word may still be
@@ -370,7 +384,7 @@ impl SessionIndex {
         best.truncate(limit);
 
         // Snippets are only built for the sessions that are actually returned
-        let mut snippet_generator = SnippetGenerator::create(&searcher, &*query, self.content)?;
+        let mut snippet_generator = SnippetGenerator::create(searcher, &*query, self.content)?;
         snippet_generator.set_max_num_chars(200);
 
         let results = best
@@ -446,10 +460,11 @@ impl SessionIndex {
     }
 
     /// Match one query word in content, title and project: the exact term, plus the most
-    /// frequent terms it is a prefix of (weighted lower) so half-typed words match.
+    /// frequent terms it is a prefix of (weighted lower) so half-typed words match,
+    /// and with `with_typos` the terms within a small edit distance (weighted lowest).
     /// Per field the best alternative counts, so a short prefix doesn't add up
     /// the scores of every word it expands to.
-    fn word_query(&self, searcher: &Searcher, word: &str) -> Result<Box<dyn Query>> {
+    fn word_query(&self, searcher: &Searcher, word: &str, with_typos: bool) -> Result<Box<dyn Query>> {
         let word_chars = word.chars().count();
         let mut fields: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for (field, field_boost) in [
@@ -461,6 +476,11 @@ impl SessionIndex {
             for term in expand_prefix(searcher, field, word, prefix_expansion_limit(word_chars))? {
                 let weight = PREFIX_WEIGHT * word_chars as f32 / term.chars().count() as f32;
                 alternatives.push(term_query(field, &term, weight));
+            }
+            if with_typos {
+                for term in expand_typos(searcher, field, word, typo_distance(word_chars))? {
+                    alternatives.push(term_query(field, &term, TYPO_WEIGHT));
+                }
             }
             let best = DisjunctionMaxQuery::with_tie_breaker(alternatives, 0.1);
             fields.push((Occur::Should, Box::new(BoostQuery::new(Box::new(best), field_boost))));
@@ -605,6 +625,87 @@ impl SessionIndex {
 }
 
 
+/// Typo-tolerant retry kicks in when fewer sessions than this match
+const TYPO_FALLBACK_MIN_SESSIONS: usize = 10;
+/// Score of a typo match relative to an exact match
+const TYPO_WEIGHT: Score = 0.3;
+const MAX_TYPO_EXPANSIONS: usize = 16;
+
+/// Edit distance tolerated for a whole word: none for short words (too many
+/// unrelated neighbours), one from 5 characters, two from 9.
+fn typo_distance(word_chars: usize) -> u8 {
+    match word_chars {
+        0..=4 => 0,
+        5..=8 => 1,
+        _ => 2,
+    }
+}
+
+/// Levenshtein DFA as an automaton over the term dictionary
+struct TypoAutomaton(DFA);
+
+impl Automaton for TypoAutomaton {
+    type State = u32;
+
+    fn start(&self) -> u32 {
+        self.0.initial_state()
+    }
+
+    fn is_match(&self, state: &u32) -> bool {
+        matches!(self.0.distance(*state), Distance::Exact(_))
+    }
+
+    fn can_match(&self, state: &u32) -> bool {
+        *state != levenshtein_automata::SINK_STATE
+    }
+
+    fn accept(&self, state: &u32, byte: u8) -> u32 {
+        self.0.transition(*state, byte)
+    }
+}
+
+/// Building a Levenshtein automaton builder is costly, so one per distance is kept
+fn typo_automaton(word: &str, distance: u8) -> TypoAutomaton {
+    static BUILDERS: OnceLock<[LevenshteinAutomatonBuilder; 2]> = OnceLock::new();
+    let builders = BUILDERS.get_or_init(|| {
+        [
+            LevenshteinAutomatonBuilder::new(1, true),
+            LevenshteinAutomatonBuilder::new(2, true),
+        ]
+    });
+    TypoAutomaton(builders[usize::from(distance) - 1].build_dfa(word))
+}
+
+/// Indexed terms of `field` within `distance` edits of `word` (excluding `word`
+/// itself), the most frequent first.
+fn expand_typos(searcher: &Searcher, field: Field, word: &str, distance: u8) -> Result<Vec<String>> {
+    if distance == 0 {
+        return Ok(Vec::new());
+    }
+    let mut doc_freqs: HashMap<Vec<u8>, u32> = HashMap::new();
+    for segment in searcher.segment_readers() {
+        let inverted_index = segment.inverted_index(field)?;
+        let mut stream = inverted_index.terms().search(typo_automaton(word, distance)).into_stream()?;
+        while stream.advance() {
+            if stream.key() != word.as_bytes() {
+                *doc_freqs.entry(stream.key().to_vec()).or_default() += stream.value().doc_freq;
+            }
+        }
+    }
+    Ok(most_frequent(doc_freqs, MAX_TYPO_EXPANSIONS))
+}
+
+/// The `limit` terms with the highest document frequency
+fn most_frequent(doc_freqs: HashMap<Vec<u8>, u32>, limit: usize) -> Vec<String> {
+    let mut terms: Vec<(Vec<u8>, u32)> = doc_freqs.into_iter().collect();
+    terms.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    terms
+        .into_iter()
+        .take(limit)
+        .filter_map(|(term, _)| String::from_utf8(term).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,6 +813,30 @@ mod tests {
 
         assert_eq!(ids(&index.search("printbox", 10).unwrap()), ["in-project"]);
         assert_eq!(ids(&index.search("72802", 10).unwrap()), ["in-project"]);
+    }
+
+    #[test]
+    fn misspelled_word_finds_the_session_when_nothing_matches_exactly() {
+        let (_dir, index) = index_with(&[session("a", 1, &["tuning the recency boost"])]);
+
+        assert_eq!(ids(&index.search("recnecy", 10).unwrap()), ["a"]);
+    }
+
+    #[test]
+    fn exact_match_ranks_above_a_typo_match() {
+        let (_dir, index) = index_with(&[
+            session("typo", 1, &["the regency era"]),
+            session("exact", 1, &["the recency era"]),
+        ]);
+
+        assert_eq!(ids(&index.search("recency", 10).unwrap()), ["exact", "typo"]);
+    }
+
+    #[test]
+    fn short_words_are_not_typo_corrected() {
+        let (_dir, index) = index_with(&[session("a", 1, &["run the test"])]);
+
+        assert!(index.search("tset", 10).unwrap().is_empty());
     }
 
     #[test]
