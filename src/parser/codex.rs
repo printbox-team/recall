@@ -21,6 +21,15 @@ struct SessionMeta {
     id: String,
     cwd: Option<String>,
     git: Option<GitInfo>,
+    source: Option<serde_json::Value>,
+}
+
+impl SessionMeta {
+    fn is_subagent(&self) -> bool {
+        self.source.as_ref().is_some_and(|source| {
+            source.as_str() == Some("subagent") || source.get("subagent").is_some()
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +93,7 @@ impl SessionParser for CodexParser {
                 "session_meta" => {
                     if let Some(payload) = &entry.payload {
                         if let Ok(meta) = serde_json::from_value::<SessionMeta>(payload.clone()) {
+                            let is_subagent = meta.is_subagent();
                             // Only set if not already set (first session_meta wins)
                             if session_id.is_none() {
                                 session_id = Some(meta.id);
@@ -94,6 +104,11 @@ impl SessionParser for CodexParser {
                             if git_branch.is_none() {
                                 git_branch = meta.git.and_then(|g| g.branch);
                             }
+                            // The indexer skips sessions with no messages.
+                            if is_subagent {
+                                messages.clear();
+                                break;
+                            }
                         }
                     }
                 }
@@ -103,6 +118,7 @@ impl SessionParser for CodexParser {
                             let role = match item.role.as_deref() {
                                 Some("user") => Role::User,
                                 Some("assistant") => Role::Assistant,
+                                Some("developer" | "system") => continue,
                                 _ => {
                                     // Try to infer role from content type
                                     if let Some(content) = &item.content {

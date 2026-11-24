@@ -527,6 +527,58 @@ fn test_cli_search_finds_fixture_content() {
 }
 
 #[test]
+fn test_cli_search_excludes_codex_subagents_and_injected_messages() {
+    use serde_json::json;
+
+    let temp_dir = TempDir::new().unwrap();
+    let sessions_dir = temp_dir.path().join(".codex/sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+
+    for (id, source) in [
+        ("conversation", json!("vscode")),
+        ("legacy", serde_json::Value::Null),
+        ("agent", json!({"subagent": {"thread_spawn": {}}})),
+        ("guardian", json!({"subagent": {"other": "guardian"}})),
+        ("agent-string", json!("subagent")),
+    ] {
+        let meta = json!({"type": "session_meta", "payload": {"id": id, "source": source}});
+        let developer = json!({"type": "response_item", "payload": {
+            "role": "developer", "content": [{"type": "input_text", "text": "statusline injected"}]
+        }});
+        let user = json!({"type": "response_item", "payload": {
+            "role": "user", "content": [{"type": "input_text", "text": "statusline question"}]
+        }});
+        std::fs::write(
+            sessions_dir.join(format!("{id}.jsonl")),
+            format!("{meta}\n{developer}\n{user}\n"),
+        )
+        .unwrap();
+    }
+
+    let (stdout, stderr, success) = run_cli(&["search", "statusline"], temp_dir.path());
+    assert!(success, "{stderr}");
+    let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let results = output["results"].as_array().unwrap();
+    let mut ids: Vec<_> = results
+        .iter()
+        .map(|r| r["session_id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["conversation", "legacy"]);
+    for result in results {
+        assert_eq!(
+            result["relevant_messages"][0]["content"],
+            "statusline question"
+        );
+    }
+
+    let (stdout, stderr, success) = run_cli(&["search", "injected"], temp_dir.path());
+    assert!(success, "{stderr}");
+    let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output["results"], json!([]));
+}
+
+#[test]
 fn test_cli_search_with_source_filter() {
     let _lock = lock_test();
     let temp_dir = setup_test_env();
