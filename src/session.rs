@@ -88,7 +88,7 @@ pub struct Session {
     /// - Claude: from `custom-title` (preferred) or `ai-title` JSONL entries
     /// - Factory: from the `title` field in JSONL lines
     /// - OpenCode: from the `title` field in the session JSON
-    /// - Codex: not stored by Codex, always None
+    /// - Codex: from the thread name in `~/.codex/session_index.jsonl`
     pub title: Option<String>,
     pub messages: Vec<Message>,
 }

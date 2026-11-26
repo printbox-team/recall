@@ -579,6 +579,45 @@ fn test_cli_search_excludes_codex_subagents_and_injected_messages() {
 }
 
 #[test]
+fn test_cli_search_shows_codex_thread_name_and_follows_renames() {
+    use serde_json::json;
+
+    let temp_dir = TempDir::new().unwrap();
+    let codex_dir = temp_dir.path().join(".codex");
+    let sessions_dir = codex_dir.join("sessions/2026/11/26");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let meta = json!({"type": "session_meta", "payload": {"id": "thread-1", "cwd": "/projects/home"}});
+    let user = json!({"type": "response_item", "payload": {
+        "role": "user", "content": [{"type": "input_text", "text": "router keeps dropping wifi"}]
+    }});
+    std::fs::write(
+        sessions_dir.join("rollout-thread-1.jsonl"),
+        format!("{meta}\n{user}\n"),
+    )
+    .unwrap();
+
+    let named = json!({"id": "thread-1", "thread_name": "mikrotik", "updated_at": "2026-11-26T12:00:00Z"});
+    std::fs::write(codex_dir.join("session_index.jsonl"), format!("{named}\n")).unwrap();
+
+    let (stdout, stderr, success) = run_cli(&["search", "mikrotik"], temp_dir.path());
+    assert!(success, "{stderr}");
+    let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output["results"][0]["title"], "mikrotik");
+
+    let renamed = json!({"id": "thread-1", "thread_name": "home network", "updated_at": "2026-11-26T13:00:00Z"});
+    std::fs::write(
+        codex_dir.join("session_index.jsonl"),
+        format!("{named}\n{renamed}\n"),
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cli(&["search", "router"], temp_dir.path());
+    assert!(success, "{stderr}");
+    let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output["results"][0]["title"], "home network");
+}
+
+#[test]
 fn test_cli_search_with_source_filter() {
     let _lock = lock_test();
     let temp_dir = setup_test_env();

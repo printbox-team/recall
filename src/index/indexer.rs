@@ -62,7 +62,7 @@ pub fn index_files(
                     let _ = index.index_session(writer, &session);
                 }
                 // Mark as indexed even if empty (so we don't reprocess it)
-                state.mark_indexed(file_path);
+                state.mark_indexed(file_path, &session);
                 indexed += 1;
             }
             Err(_) => {

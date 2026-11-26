@@ -1,3 +1,5 @@
+use crate::parser::codex_thread_name;
+use crate::session::{Session, SessionSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -15,13 +17,23 @@ pub struct IndexState {
 pub struct FileState {
     pub mtime: u64,
     pub size: u64,
+    /// Codex renames a thread without touching its rollout file, so the name the
+    /// session was indexed with is kept to notice a rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_thread: Option<CodexThread>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexThread {
+    pub id: String,
+    pub name: Option<String>,
 }
 
 impl IndexState {
     /// Bump whenever the Tantivy schema or parser output changes in a way that
     /// invalidates previously-indexed documents. `migrate_if_needed` wipes the
     /// index dir + state file when the on-disk version doesn't match.
-    const CURRENT_VERSION: u32 = 4;
+    const CURRENT_VERSION: u32 = 5;
 
     /// Load state from disk or create new
     pub fn load(state_path: &Path) -> Result<Self> {
@@ -90,16 +102,24 @@ impl IndexState {
 
         match self.indexed_files.get(path) {
             Some(indexed) => {
-                // Reindex if mtime or size changed
-                indexed.mtime != current_state.mtime || indexed.size != current_state.size
+                indexed.mtime != current_state.mtime
+                    || indexed.size != current_state.size
+                    || indexed
+                        .codex_thread
+                        .as_ref()
+                        .is_some_and(|thread| codex_thread_name(path, &thread.id) != thread.name)
             }
             None => true, // Not indexed yet
         }
     }
 
-    /// Mark a file as indexed
-    pub fn mark_indexed(&mut self, path: &Path) {
-        if let Some(state) = get_file_state(path) {
+    /// Mark a file as indexed with the session parsed from it
+    pub fn mark_indexed(&mut self, path: &Path, session: &Session) {
+        if let Some(mut state) = get_file_state(path) {
+            state.codex_thread = (session.source == SessionSource::CodexCli).then(|| CodexThread {
+                id: session.id.clone(),
+                name: session.title.clone(),
+            });
             self.indexed_files.insert(path.to_path_buf(), state);
         }
     }
@@ -121,5 +141,9 @@ fn get_file_state(path: &Path) -> Option<FileState> {
         .as_secs();
     let size = metadata.len();
 
-    Some(FileState { mtime, size })
+    Some(FileState {
+        mtime,
+        size,
+        codex_thread: None,
+    })
 }

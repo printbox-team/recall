@@ -2,9 +2,12 @@ use crate::session::{Message, Role, Session, SessionSource};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use super::{join_consecutive_messages, SessionParser};
 
@@ -48,6 +51,66 @@ struct ContentBlock {
     #[serde(rename = "type")]
     content_type: String,
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadNameEntry {
+    id: String,
+    thread_name: String,
+}
+
+/// Thread names read from one `session_index.jsonl`, kept until the file changes.
+struct ThreadNames {
+    index_path: PathBuf,
+    stamp: (SystemTime, u64),
+    names: HashMap<String, String>,
+}
+
+static THREAD_NAMES: Mutex<Option<ThreadNames>> = Mutex::new(None);
+
+/// The name Codex shows for a thread. Codex keeps names outside the rollout, in
+/// `<codex home>/session_index.jsonl`, appending a line each time a thread is named
+/// or renamed, so the last line for an id holds its current name.
+pub fn thread_name(rollout_path: &Path, thread_id: &str) -> Option<String> {
+    let index_path = rollout_path
+        .ancestors()
+        .find(|dir| dir.ends_with("sessions"))?
+        .parent()?
+        .join("session_index.jsonl");
+    let metadata = std::fs::metadata(&index_path).ok()?;
+    let stamp = (metadata.modified().ok()?, metadata.len());
+
+    let mut cache = THREAD_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = cache
+        .as_ref()
+        .is_some_and(|c| c.index_path == index_path && c.stamp == stamp);
+    if !fresh {
+        *cache = Some(ThreadNames {
+            names: read_thread_names(&index_path),
+            index_path,
+            stamp,
+        });
+    }
+    cache.as_ref()?.names.get(thread_id).cloned()
+}
+
+fn read_thread_names(index_path: &Path) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Ok(file) = File::open(index_path) else {
+        return names;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(entry) = serde_json::from_str::<ThreadNameEntry>(&line) else {
+            continue;
+        };
+        let name = entry.thread_name.trim();
+        if name.is_empty() {
+            names.remove(&entry.id);
+        } else {
+            names.insert(entry.id, name.to_string());
+        }
+    }
+    names
 }
 
 pub struct CodexParser;
@@ -168,6 +231,8 @@ impl SessionParser for CodexParser {
                 .to_string()
         });
 
+        let title = thread_name(path, &session_id);
+
         Ok(Session {
             id: session_id,
             source: SessionSource::CodexCli,
@@ -175,7 +240,7 @@ impl SessionParser for CodexParser {
             cwd: cwd.unwrap_or_else(|| ".".to_string()),
             git_branch,
             timestamp: latest_timestamp.unwrap_or_else(Utc::now),
-            title: None,
+            title,
             messages: join_consecutive_messages(messages),
         })
     }
@@ -223,6 +288,27 @@ fn extract_codex_content(item: &ResponseItem) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_thread_name_takes_last_entry_for_id() {
+        let codex_home = tempfile::TempDir::new().unwrap();
+        let rollout = codex_home.path().join("sessions/2026/11/26/rollout.jsonl");
+        std::fs::write(
+            codex_home.path().join("session_index.jsonl"),
+            [
+                r#"{"id":"a","thread_name":"first","updated_at":"2026-11-26T10:00:00Z"}"#,
+                r#"{"id":"b","thread_name":"other","updated_at":"2026-11-26T10:00:01Z"}"#,
+                r#"{"id":"a","thread_name":" renamed ","updated_at":"2026-11-26T10:00:02Z"}"#,
+                r#"{"id":"b","thread_name":"","updated_at":"2026-11-26T10:00:03Z"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        assert_eq!(thread_name(&rollout, "a").as_deref(), Some("renamed"));
+        assert_eq!(thread_name(&rollout, "b"), None);
+        assert_eq!(thread_name(&rollout, "c"), None);
+    }
 
     #[test]
     fn test_extract_codex_content() {

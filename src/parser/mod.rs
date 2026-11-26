@@ -4,7 +4,7 @@ mod factory;
 mod opencode;
 
 pub use claude::ClaudeParser;
-pub use codex::CodexParser;
+pub use codex::{thread_name as codex_thread_name, CodexParser};
 pub use factory::FactoryParser;
 pub use opencode::OpenCodeParser;
 

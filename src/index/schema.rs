@@ -205,7 +205,8 @@ impl SessionIndex {
             TextOptions::default().set_indexing_options(searchable.clone()).set_stored(),
         );
 
-        // Searchable session title (custom-title / ai-title for Claude, title for Factory/OpenCode)
+        // Searchable session title (custom-title / ai-title for Claude, thread name for Codex,
+        // title for Factory/OpenCode)
         builder.add_text_field(
             "title",
             TextOptions::default().set_indexing_options(searchable.clone()).set_stored(),
